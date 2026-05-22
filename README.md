@@ -38,10 +38,10 @@
 
 ## 环境变量
 
-| 变量名 | 说明 |
-|--------|------|
-| `BOT_TOKEN` | Telegram Bot Token |
-| `ADMIN_USER_ID` | 授权用户的 Telegram ID |
+| 类型 | 变量名 | 说明 |
+|--------|--------|------|
+| 纯文本 | `BOT_TOKEN` | Telegram Bot Token |
+| 纯文本 | `ADMIN_USER_ID` | 授权用户的 Telegram ID |
 
 ## 调试端点
 
