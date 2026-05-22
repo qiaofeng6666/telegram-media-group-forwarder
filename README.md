@@ -1,3 +1,7 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com)
+[![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-blue)](https://core.telegram.org/bots/api)
+[![GitHub stars](https://img.shields.io/github/stars/qiaofeng6666/telegram-media-group-forwarder)](https://github.com/qiaofeng6666/telegram-media-group-forwarder/stargazers)
 # Telegram Media Group Forwarder Bot
 
 一个 Cloudflare Workers 上的 Telegram 机器人，能够将媒体组（相册）作为整体转发，保持原有的多图/多视频相册结构。
