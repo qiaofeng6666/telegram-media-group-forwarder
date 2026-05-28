@@ -1,4 +1,4 @@
-// Cloudflare Worker 代码 - 优化超时版本 (1500ms)
+// Cloudflare Worker 代码 - 最小修复版本（保持原有转发逻辑）
 
 // 媒体组缓冲区
 const mediaGroupBuffer = new Map();
@@ -182,7 +182,7 @@ function scheduleTimeoutCheck(env, ctx, mediaGroupId, messageCount) {
   console.log(`   ⏲️ 设置动态超时: ${timeout}ms (当前消息数: ${messageCount})`);
 }
 
-// 处理媒体组消息
+// 处理媒体组消息 - 保持原始逻辑，只添加去重
 async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx) {
   console.log(`📸 媒体组消息: ID=${messageId}, 组ID=${mediaGroupId}`);
   
@@ -213,10 +213,18 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx
   
   if (mediaGroupBuffer.has(mediaGroupId)) {
     const group = mediaGroupBuffer.get(mediaGroupId);
-    group.messages.push({ message_id: messageId, timestamp: Date.now() });
-    group.lastUpdate = Date.now();
-    currentCount = group.messages.length;
-    console.log(`   ➕ 媒体组 ${mediaGroupId} 现有 ${currentCount} 条消息`);
+    
+    // 唯一修复：添加去重检查，避免重复添加同一条消息
+    const exists = group.messages.some(m => m.message_id === messageId);
+    if (!exists) {
+      group.messages.push({ message_id: messageId, timestamp: Date.now() });
+      group.lastUpdate = Date.now();
+      currentCount = group.messages.length;
+      console.log(`   ➕ 媒体组 ${mediaGroupId} 现有 ${currentCount} 条消息`);
+    } else {
+      currentCount = group.messages.length;
+      console.log(`   ⚠️ 消息 ${messageId} 已存在，跳过重复添加，当前总数: ${currentCount}`);
+    }
     
     // 更新超时检查
     scheduleTimeoutCheck(env, ctx, mediaGroupId, currentCount);
@@ -373,7 +381,7 @@ export default {
         max_media_group_size: MAX_MEDIA_GROUP_SIZE,
         base_timeout_ms: BASE_MEDIA_GROUP_TIMEOUT,
         dynamic_timeout_config: DYNAMIC_TIMEOUT_CONFIG,
-        note: "动态超时：消息越少等待时间越长，确保媒体组完整性"
+        note: "最小修复版：只添加去重功能，保持原有转发逻辑"
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
