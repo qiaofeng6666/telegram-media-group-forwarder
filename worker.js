@@ -1,4 +1,4 @@
-// Cloudflare Worker 代码 - 队列 + 固定200ms版（修复定时器）
+// Cloudflare Worker 代码 - 队列处理媒体组版
 
 const mediaGroupBuffer = new Map();
 const messageQueue = [];
@@ -60,7 +60,23 @@ async function finalizeMediaGroup(env, chatId, mediaGroupId) {
   return result.ok;
 }
 
-// 单线程处理队列
+// 立即转发普通消息（不进队列）
+async function forwardNormalMessage(env, chatId, messageId) {
+  const result = await sendTelegram(env.BOT_TOKEN, 'copyMessage', {
+    chat_id: Number(env.ADMIN_USER_ID),
+    from_chat_id: Number(chatId),
+    message_id: messageId
+  });
+  
+  if (result.ok) {
+    await deleteMessage(env.BOT_TOKEN, chatId, messageId);
+    console.log(`🗑️ 已删除 1 条消息`);
+    return true;
+  }
+  return false;
+}
+
+// 队列处理媒体组消息
 async function processQueue(env, ctx) {
   if (isProcessing) return;
   isProcessing = true;
@@ -71,19 +87,22 @@ async function processQueue(env, ctx) {
     let group = mediaGroupBuffer.get(mediaGroupId);
     
     if (group) {
+      // 组已存在，添加消息
       if (!group.messages.some(m => m.message_id === messageId)) {
         group.messages.push({ message_id: messageId, timestamp: Date.now() });
         group.lastUpdate = Date.now();
         const count = group.messages.length;
         console.log(`📸 ${mediaGroupId}: ${count}条`);
         
+        // 达到10条，立即发送
         if (count === MAX_MEDIA_GROUP_SIZE) {
           console.log(`🚀 达到10条，立即发送`);
           await finalizeMediaGroup(env, chatId, mediaGroupId);
         }
       }
     } else {
-      console.log(`📸 ${mediaGroupId}: 创建 (1条)，200ms后发送`);
+      // 创建新媒体组
+      console.log(`📸 ${mediaGroupId}: 创建 (1条)`);
       
       mediaGroupBuffer.set(mediaGroupId, {
         messages: [{ message_id: messageId, timestamp: Date.now() }],
@@ -92,38 +111,21 @@ async function processQueue(env, ctx) {
         isProcessing: false
       });
       
-      // 关键修复：用 ctx.waitUntil 包装定时器
-      const timerPromise = new Promise((resolve) => {
-        setTimeout(async () => {
-          console.log(`⏰ 200ms超时！发送媒体组: ${mediaGroupId}`);
+      // 不满10条，用 ctx.waitUntil 延迟200ms转发
+      const delayPromise = (async () => {
+        await new Promise(resolve => setTimeout(resolve, WAIT_TIMEOUT));
+        console.log(`⏰ 200ms延迟后发送媒体组: ${mediaGroupId}`);
+        const group = mediaGroupBuffer.get(mediaGroupId);
+        if (group && group.messages.length > 0 && group.messages.length < MAX_MEDIA_GROUP_SIZE) {
           await finalizeMediaGroup(env, chatId, mediaGroupId);
-          resolve();
-        }, WAIT_TIMEOUT);
-      });
-      ctx.waitUntil(timerPromise);
+        }
+      })();
+      
+      ctx.waitUntil(delayPromise);
     }
   }
   
   isProcessing = false;
-}
-
-async function handleNormalMessage(env, chatId, messageId) {
-  for (const [groupId, group] of mediaGroupBuffer.entries()) {
-    if (group && !group.isProcessing) {
-      await finalizeMediaGroup(env, chatId, groupId);
-    }
-  }
-  
-  const result = await sendTelegram(env.BOT_TOKEN, 'copyMessage', {
-    chat_id: Number(env.ADMIN_USER_ID),
-    from_chat_id: Number(chatId),
-    message_id: messageId
-  });
-  
-  if (result.ok) {
-    await deleteMessage(env.BOT_TOKEN, chatId, messageId);
-    console.log(`🗑️ 已删除 1 条消息`);
-  }
 }
 
 async function handleUpdate(env, ctx, update) {
@@ -138,11 +140,14 @@ async function handleUpdate(env, ctx, update) {
   const messageId = msg.message_id;
   const mediaGroupId = msg.media_group_id;
   
-  if (mediaGroupId) {
+  if (!mediaGroupId) {
+    // 普通消息：直接转发，不进队列
+    console.log(`📄 普通消息: ${messageId}，直接转发`);
+    await forwardNormalMessage(env, chatId, messageId);
+  } else {
+    // 媒体组消息：加入队列处理
     messageQueue.push({ chatId, messageId, mediaGroupId });
     await processQueue(env, ctx);
-  } else {
-    await handleNormalMessage(env, chatId, messageId);
   }
 }
 
@@ -159,7 +164,10 @@ export default {
       for (const [id, g] of mediaGroupBuffer.entries()) {
         info[id] = { count: g.messages.length };
       }
-      return new Response(JSON.stringify({ buffer: info, queue: messageQueue.length }), {
+      return new Response(JSON.stringify({ 
+        buffer: info, 
+        queue: messageQueue.length 
+      }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
