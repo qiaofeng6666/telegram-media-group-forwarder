@@ -1,4 +1,4 @@
-// Cloudflare Worker 代码 - 最终修复版
+// Cloudflare Worker 代码 - 最终版
 
 const mediaGroupBuffer = new Map();
 const MAX_MEDIA_GROUP_SIZE = 10;
@@ -45,7 +45,7 @@ async function finalizeMediaGroup(env, chatId, mediaGroupId) {
   
   group.isProcessing = true;
   const messageIds = group.messages.map(m => m.message_id);
-  console.log(`🎯 发送 ${mediaGroupId}: ${messageIds.length}条`);
+  console.log(`🎯 发送媒体组: ${messageIds.length}条`);
   
   const result = await copyMultipleMessages(env.BOT_TOKEN, chatId, env.ADMIN_USER_ID, messageIds);
   
@@ -53,7 +53,9 @@ async function finalizeMediaGroup(env, chatId, mediaGroupId) {
     for (const msgId of messageIds) {
       await deleteMessage(env.BOT_TOKEN, chatId, msgId);
     }
-    console.log(`✅ 发送成功`);
+    console.log(`🗑️ 已删除 ${messageIds.length} 条原始消息`);
+  } else {
+    console.error(`❌ 转发失败: ${result.description}`);
   }
   
   mediaGroupBuffer.delete(mediaGroupId);
@@ -73,29 +75,27 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId) {
       group.messages.push({ message_id: messageId, timestamp: Date.now() });
       group.lastUpdate = Date.now();
       const count = group.messages.length;
-      console.log(`📸 ${mediaGroupId}: ${count}条`);
       
       if (count === MAX_MEDIA_GROUP_SIZE) {
-        // 达到10条，立即发送
+        if (group.timerId) {
+          clearTimeout(group.timerId);
+          group.timerId = null;
+        }
         await finalizeMediaGroup(env, chatId, mediaGroupId);
       } else {
-        // 关键修复：先清除旧定时器，再设置新定时器
         if (group.timerId) {
           clearTimeout(group.timerId);
           group.timerId = null;
         }
         const timeout = getTimeout(count);
         group.timerId = setTimeout(async () => {
-          console.log(`⏰ 超时: ${mediaGroupId} (${count}条)`);
           await finalizeMediaGroup(env, chatId, mediaGroupId);
         }, timeout);
       }
     }
   } else {
-    console.log(`📸 ${mediaGroupId}: 创建`);
     const timeout = getTimeout(1);
     const timerId = setTimeout(async () => {
-      console.log(`⏰ 超时: ${mediaGroupId} (1条)`);
       await finalizeMediaGroup(env, chatId, mediaGroupId);
     }, timeout);
     
@@ -110,7 +110,6 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId) {
 }
 
 async function handleNormalMessage(env, chatId, messageId) {
-  // 先发送所有缓冲的媒体组
   for (const [groupId, group] of mediaGroupBuffer.entries()) {
     if (group && !group.isProcessing) {
       if (group.timerId) {
@@ -128,6 +127,7 @@ async function handleNormalMessage(env, chatId, messageId) {
   
   if (result.ok) {
     await deleteMessage(env.BOT_TOKEN, chatId, messageId);
+    console.log(`🗑️ 已删除 1 条消息`);
   }
 }
 
@@ -161,7 +161,7 @@ export default {
     if (request.method === 'GET' && url.pathname === '/health') {
       const info = {};
       for (const [id, g] of mediaGroupBuffer.entries()) {
-        info[id] = { count: g.messages.length, hasTimer: !!g.timerId };
+        info[id] = { count: g.messages.length };
       }
       return new Response(JSON.stringify({ buffer: info }), {
         headers: { 'Content-Type': 'application/json' }
@@ -179,7 +179,6 @@ export default {
     if (request.method === 'POST' && url.pathname === '/webhook') {
       try {
         const update = await request.json();
-        // 关键：不使用 waitUntil，让 fetch 等待处理完成
         await handleUpdate(env, update);
         return new Response('OK', { status: 200 });
       } catch (error) {
