@@ -1,7 +1,10 @@
-// Cloudflare Worker 代码 - 最小修复版本（保持原有转发逻辑）
+// Cloudflare Worker 代码 - 修复并发创建同一媒体组的问题
 
 // 媒体组缓冲区
 const mediaGroupBuffer = new Map();
+
+// 添加：正在创建中的媒体组锁
+const creatingGroups = new Set();
 
 // Telegram 媒体组最多 10 条消息
 const MAX_MEDIA_GROUP_SIZE = 10;
@@ -61,8 +64,8 @@ async function copyMultipleMessages(botToken, fromChatId, toChatId, messageIds) 
   console.log(`📦 批量复制 ${sortedIds.length} 条消息，IDs: ${sortedIds.join(', ')}`);
   
   const result = await sendTelegram(botToken, 'copyMessages', {
-    chat_id: toChatId,
-    from_chat_id: fromChatId,
+    chat_id: Number(toChatId),
+    from_chat_id: Number(fromChatId),
     message_ids: sortedIds
   });
   
@@ -114,11 +117,9 @@ async function finalizeMediaGroup(env, chatId, mediaGroupId) {
 
 // 获取动态超时时间
 function getDynamicTimeout(messageCount) {
-  // 如果达到最大数量，立即发送（超时0）
   if (messageCount >= MAX_MEDIA_GROUP_SIZE) {
     return 0;
   }
-  // 根据消息数量返回对应的超时时间
   return DYNAMIC_TIMEOUT_CONFIG[messageCount] || BASE_MEDIA_GROUP_TIMEOUT;
 }
 
@@ -151,18 +152,15 @@ async function checkAndProcessTimeouts(env) {
 function scheduleTimeoutCheck(env, ctx, mediaGroupId, messageCount) {
   const timeout = getDynamicTimeout(messageCount);
   
-  // 如果超时时间为0，立即处理
   if (timeout === 0) {
     return;
   }
   
-  // 清除已有的定时器
   if (pendingTimeouts.has(mediaGroupId)) {
     const oldTimer = pendingTimeouts.get(mediaGroupId);
     clearTimeout(oldTimer);
   }
   
-  // 设置新的定时器
   const timerId = setTimeout(async () => {
     pendingTimeouts.delete(mediaGroupId);
     await checkAndProcessTimeouts(env);
@@ -170,7 +168,6 @@ function scheduleTimeoutCheck(env, ctx, mediaGroupId, messageCount) {
   
   pendingTimeouts.set(mediaGroupId, timerId);
   
-  // 同时使用 ctx.waitUntil 确保任务完成
   const timeoutPromise = new Promise(async (resolve) => {
     await new Promise(r => setTimeout(r, timeout));
     await checkAndProcessTimeouts(env);
@@ -182,7 +179,12 @@ function scheduleTimeoutCheck(env, ctx, mediaGroupId, messageCount) {
   console.log(`   ⏲️ 设置动态超时: ${timeout}ms (当前消息数: ${messageCount})`);
 }
 
-// 处理媒体组消息 - 保持原始逻辑，只添加去重
+// 延迟等待函数
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 处理媒体组消息 - 修复并发创建问题
 async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx) {
   console.log(`📸 媒体组消息: ID=${messageId}, 组ID=${mediaGroupId}`);
   
@@ -193,11 +195,9 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx
   if (mediaGroupBuffer.size > 0) {
     const existingGroupIds = Array.from(mediaGroupBuffer.keys());
     
-    // 如果当前消息的媒体组 ID 与缓冲区中的不同，且不是同一个组
     if (!existingGroupIds.includes(mediaGroupId)) {
       console.log(`   🔄 检测到不同媒体组: 当前=${mediaGroupId}, 缓冲区中的=${existingGroupIds.join(', ')}`);
       
-      // 发送所有旧的媒体组（不是当前的）
       for (const oldGroupId of existingGroupIds) {
         const oldGroup = mediaGroupBuffer.get(oldGroupId);
         if (oldGroup && !oldGroup.isProcessing) {
@@ -208,13 +208,21 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx
     }
   }
   
-  // 添加到当前媒体组
+  // 修复：处理并发创建同一媒体组的问题
   let currentCount = 0;
+  let retryCount = 0;
+  const maxRetries = 10; // 最多等待1秒
+  
+  // 如果媒体组正在创建中，等待它创建完成
+  while (creatingGroups.has(mediaGroupId) && !mediaGroupBuffer.has(mediaGroupId) && retryCount < maxRetries) {
+    console.log(`   ⏳ 媒体组 ${mediaGroupId} 正在创建中，等待 ${retryCount * 50}ms...`);
+    await wait(50);
+    retryCount++;
+  }
   
   if (mediaGroupBuffer.has(mediaGroupId)) {
     const group = mediaGroupBuffer.get(mediaGroupId);
     
-    // 唯一修复：添加去重检查，避免重复添加同一条消息
     const exists = group.messages.some(m => m.message_id === messageId);
     if (!exists) {
       group.messages.push({ message_id: messageId, timestamp: Date.now() });
@@ -226,27 +234,32 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx
       console.log(`   ⚠️ 消息 ${messageId} 已存在，跳过重复添加，当前总数: ${currentCount}`);
     }
     
-    // 更新超时检查
     scheduleTimeoutCheck(env, ctx, mediaGroupId, currentCount);
   } else {
-    console.log(`   🆕 创建新媒体组 ${mediaGroupId}，第一条消息 ID=${messageId}`);
-    mediaGroupBuffer.set(mediaGroupId, {
-      messages: [{ message_id: messageId, timestamp: Date.now() }],
-      lastUpdate: Date.now(),
-      chatId: chatId,
-      isProcessing: false
-    });
-    currentCount = 1;
+    // 标记正在创建
+    creatingGroups.add(mediaGroupId);
     
-    // 为新媒体组设置超时检查
-    scheduleTimeoutCheck(env, ctx, mediaGroupId, currentCount);
+    try {
+      console.log(`   🆕 创建新媒体组 ${mediaGroupId}，第一条消息 ID=${messageId}`);
+      mediaGroupBuffer.set(mediaGroupId, {
+        messages: [{ message_id: messageId, timestamp: Date.now() }],
+        lastUpdate: Date.now(),
+        chatId: chatId,
+        isProcessing: false
+      });
+      currentCount = 1;
+      
+      scheduleTimeoutCheck(env, ctx, mediaGroupId, currentCount);
+    } finally {
+      // 创建完成，移除标记
+      creatingGroups.delete(mediaGroupId);
+    }
   }
   
   // 如果达到最大数量（10条），立即发送并清除定时器
   if (currentCount === MAX_MEDIA_GROUP_SIZE) {
     console.log(`   🚀 已达到媒体组最大数量 ${MAX_MEDIA_GROUP_SIZE} 条，立即发送！`);
     
-    // 清除定时器
     if (pendingTimeouts.has(mediaGroupId)) {
       const timerId = pendingTimeouts.get(mediaGroupId);
       clearTimeout(timerId);
@@ -266,10 +279,8 @@ async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx
 async function handleNormalMessage(env, chatId, messageId, ctx) {
   console.log(`📄 普通消息: ID=${messageId}，直接复制`);
   
-  // 先检查并处理所有超时的媒体组
   await checkAndProcessTimeouts(env);
   
-  // 如果有正在等待的媒体组，先发送它们
   if (mediaGroupBuffer.size > 0) {
     const existingGroupIds = Array.from(mediaGroupBuffer.keys());
     console.log(`   📤 收到普通消息，先发送缓冲区中的 ${existingGroupIds.length} 个媒体组...`);
@@ -284,8 +295,8 @@ async function handleNormalMessage(env, chatId, messageId, ctx) {
   
   try {
     await sendTelegram(env.BOT_TOKEN, 'copyMessage', {
-      chat_id: env.ADMIN_USER_ID,
-      from_chat_id: chatId,
+      chat_id: Number(env.ADMIN_USER_ID),
+      from_chat_id: Number(chatId),
       message_id: messageId
     });
     await deleteMessage(env.BOT_TOKEN, chatId, messageId);
@@ -329,7 +340,6 @@ async function handleUpdate(env, update, ctx) {
     result = await handleNormalMessage(env, chatId, messageId, ctx);
   }
   
-  // 在响应返回后，再次安排超时检查，确保最后的媒体组能被处理
   if (mediaGroupBuffer.size > 0) {
     for (const [groupId, group] of mediaGroupBuffer.entries()) {
       if (!group.isProcessing) {
@@ -377,11 +387,12 @@ export default {
         status: 'ok',
         buffer_size: mediaGroupBuffer.size,
         total_buffered_messages: totalMessages,
+        creating_groups: Array.from(creatingGroups),
         buffer_info: bufferInfo,
         max_media_group_size: MAX_MEDIA_GROUP_SIZE,
         base_timeout_ms: BASE_MEDIA_GROUP_TIMEOUT,
         dynamic_timeout_config: DYNAMIC_TIMEOUT_CONFIG,
-        note: "最小修复版：只添加去重功能，保持原有转发逻辑"
+        note: "修复并发创建同一媒体组问题"
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -417,7 +428,7 @@ export default {
       });
     }
     
-    // 清除缓冲区 - 先转发所有消息再清理
+    // 清除缓冲区
     if (request.method === 'POST' && url.pathname === '/clearbuffer') {
       const groupIds = Array.from(mediaGroupBuffer.keys());
       let totalMessages = 0;
@@ -443,15 +454,9 @@ export default {
         }
       }
       
-      // 清理残留
-      for (const [groupId, group] of mediaGroupBuffer.entries()) {
-        if (group.timeoutId) {
-          clearTimeout(group.timeoutId);
-        }
-      }
       mediaGroupBuffer.clear();
+      creatingGroups.clear();
       
-      // 清除所有定时器
       for (const timerId of pendingTimeouts.values()) {
         clearTimeout(timerId);
       }
