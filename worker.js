@@ -1,7 +1,6 @@
-// Cloudflare Worker 代码 - 最终稳定版
+// Cloudflare Worker 代码 - 最终修复版
 
 const mediaGroupBuffer = new Map();
-const creatingGroups = new Set();
 const MAX_MEDIA_GROUP_SIZE = 10;
 
 const DYNAMIC_TIMEOUT_CONFIG = {
@@ -30,7 +29,7 @@ async function deleteMessage(botToken, chatId, messageId) {
 
 async function copyMultipleMessages(botToken, fromChatId, toChatId, messageIds) {
   const sortedIds = [...messageIds].sort((a, b) => a - b);
-  console.log(`📦 复制 ${sortedIds.length} 条: ${sortedIds.join(',')}`);
+  console.log(`📦 复制 ${sortedIds.length} 条`);
   return await sendTelegram(botToken, 'copyMessages', {
     chat_id: Number(toChatId),
     from_chat_id: Number(fromChatId),
@@ -40,11 +39,13 @@ async function copyMultipleMessages(botToken, fromChatId, toChatId, messageIds) 
 
 async function finalizeMediaGroup(env, chatId, mediaGroupId) {
   const group = mediaGroupBuffer.get(mediaGroupId);
-  if (!group || group.messages.length === 0 || group.isProcessing) return false;
+  if (!group || group.messages.length === 0 || group.isProcessing) {
+    return false;
+  }
   
   group.isProcessing = true;
   const messageIds = group.messages.map(m => m.message_id);
-  console.log(`🎯 发送媒体组 ${mediaGroupId}: ${messageIds.length}条`);
+  console.log(`🎯 发送 ${mediaGroupId}: ${messageIds.length}条`);
   
   const result = await copyMultipleMessages(env.BOT_TOKEN, chatId, env.ADMIN_USER_ID, messageIds);
   
@@ -52,79 +53,69 @@ async function finalizeMediaGroup(env, chatId, mediaGroupId) {
     for (const msgId of messageIds) {
       await deleteMessage(env.BOT_TOKEN, chatId, msgId);
     }
+    console.log(`✅ 发送成功`);
   }
   
-  if (group.timerId) clearTimeout(group.timerId);
   mediaGroupBuffer.delete(mediaGroupId);
   return result.ok;
 }
 
 function getTimeout(count) {
-  return count >= MAX_MEDIA_GROUP_SIZE ? 0 : (DYNAMIC_TIMEOUT_CONFIG[count] || 1500);
+  if (count >= MAX_MEDIA_GROUP_SIZE) return 0;
+  return DYNAMIC_TIMEOUT_CONFIG[count] || 1500;
 }
 
-function scheduleTimeout(env, ctx, groupId, count, chatId) {
-  const timeout = getTimeout(count);
-  if (timeout === 0) return;
-  
-  const group = mediaGroupBuffer.get(groupId);
-  if (!group) return;
-  
-  if (group.timerId) clearTimeout(group.timerId);
-  
-  const timerPromise = new Promise((resolve) => {
-    group.timerId = setTimeout(() => {
-      console.log(`⏰ 超时: ${groupId} (${count}条)`);
-      finalizeMediaGroup(env, chatId, groupId).then(resolve);
-    }, timeout);
-  });
-  ctx.waitUntil(timerPromise);
-}
-
-async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx) {
-  // 等待正在创建的组
-  while (creatingGroups.has(mediaGroupId)) {
-    await new Promise(r => setTimeout(r, 10));
-  }
-  
+async function handleMediaGroupMessage(env, chatId, messageId, mediaGroupId) {
   let group = mediaGroupBuffer.get(mediaGroupId);
   
   if (group) {
     if (!group.messages.some(m => m.message_id === messageId)) {
       group.messages.push({ message_id: messageId, timestamp: Date.now() });
       group.lastUpdate = Date.now();
-      console.log(`📸 ${mediaGroupId}: +1 (${group.messages.length}条)`);
-      scheduleTimeout(env, ctx, mediaGroupId, group.messages.length, chatId);
+      const count = group.messages.length;
+      console.log(`📸 ${mediaGroupId}: ${count}条`);
+      
+      if (count === MAX_MEDIA_GROUP_SIZE) {
+        // 达到10条，立即发送
+        await finalizeMediaGroup(env, chatId, mediaGroupId);
+      } else {
+        // 关键修复：先清除旧定时器，再设置新定时器
+        if (group.timerId) {
+          clearTimeout(group.timerId);
+          group.timerId = null;
+        }
+        const timeout = getTimeout(count);
+        group.timerId = setTimeout(async () => {
+          console.log(`⏰ 超时: ${mediaGroupId} (${count}条)`);
+          await finalizeMediaGroup(env, chatId, mediaGroupId);
+        }, timeout);
+      }
     }
   } else {
-    creatingGroups.add(mediaGroupId);
-    try {
-      mediaGroupBuffer.set(mediaGroupId, {
-        messages: [{ message_id: messageId, timestamp: Date.now() }],
-        lastUpdate: Date.now(),
-        chatId: chatId,
-        isProcessing: false,
-        timerId: null
-      });
-      console.log(`📸 ${mediaGroupId}: 创建 (1条)`);
-      scheduleTimeout(env, ctx, mediaGroupId, 1, chatId);
-    } finally {
-      creatingGroups.delete(mediaGroupId);
-    }
-    group = mediaGroupBuffer.get(mediaGroupId);
-  }
-  
-  if (group && group.messages.length === MAX_MEDIA_GROUP_SIZE) {
-    if (group.timerId) clearTimeout(group.timerId);
-    await finalizeMediaGroup(env, chatId, mediaGroupId);
+    console.log(`📸 ${mediaGroupId}: 创建`);
+    const timeout = getTimeout(1);
+    const timerId = setTimeout(async () => {
+      console.log(`⏰ 超时: ${mediaGroupId} (1条)`);
+      await finalizeMediaGroup(env, chatId, mediaGroupId);
+    }, timeout);
+    
+    mediaGroupBuffer.set(mediaGroupId, {
+      messages: [{ message_id: messageId, timestamp: Date.now() }],
+      lastUpdate: Date.now(),
+      chatId: chatId,
+      isProcessing: false,
+      timerId: timerId
+    });
   }
 }
 
-async function handleNormalMessage(env, chatId, messageId, ctx) {
+async function handleNormalMessage(env, chatId, messageId) {
   // 先发送所有缓冲的媒体组
   for (const [groupId, group] of mediaGroupBuffer.entries()) {
     if (group && !group.isProcessing) {
-      if (group.timerId) clearTimeout(group.timerId);
+      if (group.timerId) {
+        clearTimeout(group.timerId);
+      }
       await finalizeMediaGroup(env, chatId, groupId);
     }
   }
@@ -140,7 +131,7 @@ async function handleNormalMessage(env, chatId, messageId, ctx) {
   }
 }
 
-async function handleUpdate(env, update, ctx) {
+async function handleUpdate(env, update) {
   if (!update.message) return;
   
   const msg = update.message;
@@ -153,9 +144,9 @@ async function handleUpdate(env, update, ctx) {
   const mediaGroupId = msg.media_group_id;
   
   if (mediaGroupId) {
-    await handleMediaGroupMessage(env, chatId, messageId, mediaGroupId, ctx);
+    await handleMediaGroupMessage(env, chatId, messageId, mediaGroupId);
   } else {
-    await handleNormalMessage(env, chatId, messageId, ctx);
+    await handleNormalMessage(env, chatId, messageId);
   }
 }
 
@@ -170,7 +161,7 @@ export default {
     if (request.method === 'GET' && url.pathname === '/health') {
       const info = {};
       for (const [id, g] of mediaGroupBuffer.entries()) {
-        info[id] = { count: g.messages.length, ids: g.messages.map(m => m.message_id) };
+        info[id] = { count: g.messages.length, hasTimer: !!g.timerId };
       }
       return new Response(JSON.stringify({ buffer: info }), {
         headers: { 'Content-Type': 'application/json' }
@@ -188,7 +179,8 @@ export default {
     if (request.method === 'POST' && url.pathname === '/webhook') {
       try {
         const update = await request.json();
-        await handleUpdate(env, update, ctx);
+        // 关键：不使用 waitUntil，让 fetch 等待处理完成
+        await handleUpdate(env, update);
         return new Response('OK', { status: 200 });
       } catch (error) {
         console.error(error);
