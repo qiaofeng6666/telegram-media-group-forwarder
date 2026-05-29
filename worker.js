@@ -1,6 +1,7 @@
-// Cloudflare Worker 代码 - 快速轮询版（2秒超时）
+// Cloudflare Worker 代码 - 带并发锁的快速轮询版
 
 const mediaGroupBuffer = new Map();
+const creatingGroups = new Set();  // 添加锁
 const MAX_MEDIA_GROUP_SIZE = 10;
 
 const DYNAMIC_TIMEOUT_CONFIG = {
@@ -65,36 +66,25 @@ function getTimeout(count) {
   return DYNAMIC_TIMEOUT_CONFIG[count] || 1500;
 }
 
-// 快速轮询：最多20次 × 100ms = 2秒
 async function startPolling(env, ctx, mediaGroupId) {
-  const maxAttempts = 20;  // 20次
-  const interval = 100;    // 100ms
+  const maxAttempts = 20;
+  const interval = 100;
   
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(resolve => setTimeout(resolve, interval));
     
     const group = mediaGroupBuffer.get(mediaGroupId);
-    if (!group) {
-      // 已被处理，停止轮询
-      return;
-    }
-    
-    if (group.isProcessing) {
-      // 正在处理中，等待
-      continue;
-    }
+    if (!group || group.isProcessing) continue;
     
     const timeSinceLastUpdate = Date.now() - group.lastUpdate;
     const timeout = getTimeout(group.messages.length);
     
-    // 检查是否超时
     if (timeSinceLastUpdate >= timeout) {
-      console.log(`⏰ 轮询超时: ${mediaGroupId} (${group.messages.length}条, 等待${timeSinceLastUpdate}ms)`);
+      console.log(`⏰ 轮询超时: ${mediaGroupId} (${group.messages.length}条)`);
       await finalizeMediaGroup(env, group.chatId, mediaGroupId);
       return;
     }
     
-    // 如果已达到10条，立即发送
     if (group.messages.length === MAX_MEDIA_GROUP_SIZE) {
       console.log(`🚀 轮询检测到10条: ${mediaGroupId}`);
       await finalizeMediaGroup(env, group.chatId, mediaGroupId);
@@ -102,7 +92,6 @@ async function startPolling(env, ctx, mediaGroupId) {
     }
   }
   
-  // 2秒后还没收到新消息，强制发送
   const group = mediaGroupBuffer.get(mediaGroupId);
   if (group && !group.isProcessing) {
     console.log(`⏰ 轮询结束，强制发送: ${mediaGroupId} (${group.messages.length}条)`);
@@ -111,6 +100,11 @@ async function startPolling(env, ctx, mediaGroupId) {
 }
 
 async function handleMediaGroupMessage(env, ctx, chatId, messageId, mediaGroupId) {
+  // 等待正在创建的组
+  while (creatingGroups.has(mediaGroupId)) {
+    await new Promise(r => setTimeout(r, 10));
+  }
+  
   let group = mediaGroupBuffer.get(mediaGroupId);
   
   if (group) {
@@ -126,21 +120,26 @@ async function handleMediaGroupMessage(env, ctx, chatId, messageId, mediaGroupId
       }
     }
   } else {
-    console.log(`📸 ${mediaGroupId}: 创建 (1条)`);
-    mediaGroupBuffer.set(mediaGroupId, {
-      messages: [{ message_id: messageId, timestamp: Date.now() }],
-      lastUpdate: Date.now(),
-      chatId: chatId,
-      isProcessing: false
-    });
-    
-    // 启动轮询
-    ctx.waitUntil(startPolling(env, ctx, mediaGroupId));
+    // 加锁创建
+    creatingGroups.add(mediaGroupId);
+    try {
+      console.log(`📸 ${mediaGroupId}: 创建 (1条)`);
+      mediaGroupBuffer.set(mediaGroupId, {
+        messages: [{ message_id: messageId, timestamp: Date.now() }],
+        lastUpdate: Date.now(),
+        chatId: chatId,
+        isProcessing: false
+      });
+      
+      // 启动轮询
+      ctx.waitUntil(startPolling(env, ctx, mediaGroupId));
+    } finally {
+      creatingGroups.delete(mediaGroupId);
+    }
   }
 }
 
 async function handleNormalMessage(env, ctx, chatId, messageId) {
-  // 发送所有缓冲的媒体组
   for (const [groupId, group] of mediaGroupBuffer.entries()) {
     if (group && !group.isProcessing) {
       await finalizeMediaGroup(env, chatId, groupId);
@@ -191,7 +190,7 @@ export default {
       for (const [id, g] of mediaGroupBuffer.entries()) {
         info[id] = { count: g.messages.length };
       }
-      return new Response(JSON.stringify({ buffer: info }), {
+      return new Response(JSON.stringify({ buffer: info, creating: Array.from(creatingGroups) }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
