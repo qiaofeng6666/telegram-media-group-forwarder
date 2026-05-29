@@ -1,13 +1,15 @@
-// Cloudflare Worker 代码 - 带并发锁的快速轮询版
+// Cloudflare Worker 代码 - 全局单轮询版
 
 const mediaGroupBuffer = new Map();
-const creatingGroups = new Set();  // 添加锁
+const creatingGroups = new Set();
 const MAX_MEDIA_GROUP_SIZE = 10;
 
 const DYNAMIC_TIMEOUT_CONFIG = {
   1: 2000, 2: 1800, 3: 1500, 4: 1200, 5: 1000,
   6: 800, 7: 700, 8: 600, 9: 550, 10: 500
 };
+
+let pollingActive = false;
 
 async function sendTelegram(botToken, method, body) {
   const url = `https://api.telegram.org/bot${botToken}/${method}`;
@@ -66,36 +68,34 @@ function getTimeout(count) {
   return DYNAMIC_TIMEOUT_CONFIG[count] || 1500;
 }
 
-async function startPolling(env, ctx, mediaGroupId) {
-  const maxAttempts = 20;
-  const interval = 100;
+// 全局轮询任务（只启动一次）
+async function globalPolling(env) {
+  console.log(`🔄 全局轮询任务启动`);
   
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise(resolve => setTimeout(resolve, interval));
+  while (true) {
+    await new Promise(resolve => setTimeout(resolve, 200)); // 每200ms检查一次
     
-    const group = mediaGroupBuffer.get(mediaGroupId);
-    if (!group || group.isProcessing) continue;
+    const now = Date.now();
+    const expiredGroups = [];
     
-    const timeSinceLastUpdate = Date.now() - group.lastUpdate;
-    const timeout = getTimeout(group.messages.length);
-    
-    if (timeSinceLastUpdate >= timeout) {
-      console.log(`⏰ 轮询超时: ${mediaGroupId} (${group.messages.length}条)`);
-      await finalizeMediaGroup(env, group.chatId, mediaGroupId);
-      return;
+    for (const [groupId, group] of mediaGroupBuffer.entries()) {
+      if (group.isProcessing) continue;
+      
+      const timeSinceLastUpdate = now - group.lastUpdate;
+      const timeout = getTimeout(group.messages.length);
+      
+      if (timeSinceLastUpdate >= timeout) {
+        expiredGroups.push(groupId);
+      }
     }
     
-    if (group.messages.length === MAX_MEDIA_GROUP_SIZE) {
-      console.log(`🚀 轮询检测到10条: ${mediaGroupId}`);
-      await finalizeMediaGroup(env, group.chatId, mediaGroupId);
-      return;
+    for (const groupId of expiredGroups) {
+      const group = mediaGroupBuffer.get(groupId);
+      if (group && !group.isProcessing) {
+        console.log(`⏰ 全局轮询超时: ${groupId} (${group.messages.length}条)`);
+        await finalizeMediaGroup(env, group.chatId, groupId);
+      }
     }
-  }
-  
-  const group = mediaGroupBuffer.get(mediaGroupId);
-  if (group && !group.isProcessing) {
-    console.log(`⏰ 轮询结束，强制发送: ${mediaGroupId} (${group.messages.length}条)`);
-    await finalizeMediaGroup(env, group.chatId, mediaGroupId);
   }
 }
 
@@ -130,9 +130,6 @@ async function handleMediaGroupMessage(env, ctx, chatId, messageId, mediaGroupId
         chatId: chatId,
         isProcessing: false
       });
-      
-      // 启动轮询
-      ctx.waitUntil(startPolling(env, ctx, mediaGroupId));
     } finally {
       creatingGroups.delete(mediaGroupId);
     }
@@ -140,6 +137,7 @@ async function handleMediaGroupMessage(env, ctx, chatId, messageId, mediaGroupId
 }
 
 async function handleNormalMessage(env, ctx, chatId, messageId) {
+  // 发送所有缓冲的媒体组
   for (const [groupId, group] of mediaGroupBuffer.entries()) {
     if (group && !group.isProcessing) {
       await finalizeMediaGroup(env, chatId, groupId);
@@ -177,10 +175,18 @@ async function handleUpdate(env, ctx, update) {
   }
 }
 
+let globalPollingStarted = false;
+
 export default {
   async fetch(request, env, ctx) {
     if (!env.BOT_TOKEN || !env.ADMIN_USER_ID) {
       return new Response('Missing env vars', { status: 500 });
+    }
+    
+    // 只启动一次全局轮询
+    if (!globalPollingStarted) {
+      globalPollingStarted = true;
+      ctx.waitUntil(globalPolling(env));
     }
     
     const url = new URL(request.url);
@@ -190,7 +196,7 @@ export default {
       for (const [id, g] of mediaGroupBuffer.entries()) {
         info[id] = { count: g.messages.length };
       }
-      return new Response(JSON.stringify({ buffer: info, creating: Array.from(creatingGroups) }), {
+      return new Response(JSON.stringify({ buffer: info, polling: globalPollingStarted }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
