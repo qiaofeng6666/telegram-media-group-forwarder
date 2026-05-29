@@ -1,15 +1,14 @@
-// Cloudflare Worker 代码 - 全局单轮询版
+// Cloudflare Worker 代码 - 消息队列版
 
 const mediaGroupBuffer = new Map();
-const creatingGroups = new Set();
+const messageQueue = [];  // 消息队列
+let isProcessing = false;  // 队列处理锁
 const MAX_MEDIA_GROUP_SIZE = 10;
 
 const DYNAMIC_TIMEOUT_CONFIG = {
   1: 2000, 2: 1800, 3: 1500, 4: 1200, 5: 1000,
   6: 800, 7: 700, 8: 600, 9: 550, 10: 500
 };
-
-let pollingActive = false;
 
 async function sendTelegram(botToken, method, body) {
   const url = `https://api.telegram.org/bot${botToken}/${method}`;
@@ -68,78 +67,62 @@ function getTimeout(count) {
   return DYNAMIC_TIMEOUT_CONFIG[count] || 1500;
 }
 
-// 全局轮询任务（只启动一次）
-async function globalPolling(env) {
-  console.log(`🔄 全局轮询任务启动`);
+// 单线程处理队列
+async function processQueue(env, ctx) {
+  if (isProcessing) return;
+  isProcessing = true;
   
-  while (true) {
-    await new Promise(resolve => setTimeout(resolve, 200)); // 每200ms检查一次
+  while (messageQueue.length > 0) {
+    const { chatId, messageId, mediaGroupId } = messageQueue.shift();
     
-    const now = Date.now();
-    const expiredGroups = [];
+    let group = mediaGroupBuffer.get(mediaGroupId);
     
-    for (const [groupId, group] of mediaGroupBuffer.entries()) {
-      if (group.isProcessing) continue;
-      
-      const timeSinceLastUpdate = now - group.lastUpdate;
-      const timeout = getTimeout(group.messages.length);
-      
-      if (timeSinceLastUpdate >= timeout) {
-        expiredGroups.push(groupId);
+    if (group) {
+      if (!group.messages.some(m => m.message_id === messageId)) {
+        group.messages.push({ message_id: messageId, timestamp: Date.now() });
+        group.lastUpdate = Date.now();
+        const count = group.messages.length;
+        console.log(`📸 ${mediaGroupId}: ${count}条`);
+        
+        if (count === MAX_MEDIA_GROUP_SIZE) {
+          console.log(`🚀 达到10条，立即发送`);
+          await finalizeMediaGroup(env, chatId, mediaGroupId);
+        } else {
+          // 刷新定时器
+          if (group.timerId) clearTimeout(group.timerId);
+          const timeout = getTimeout(count);
+          group.timerId = setTimeout(() => {
+            console.log(`⏰ 超时: ${mediaGroupId} (${count}条)`);
+            finalizeMediaGroup(env, chatId, mediaGroupId);
+          }, timeout);
+        }
       }
-    }
-    
-    for (const groupId of expiredGroups) {
-      const group = mediaGroupBuffer.get(groupId);
-      if (group && !group.isProcessing) {
-        console.log(`⏰ 全局轮询超时: ${groupId} (${group.messages.length}条)`);
-        await finalizeMediaGroup(env, group.chatId, groupId);
-      }
-    }
-  }
-}
-
-async function handleMediaGroupMessage(env, ctx, chatId, messageId, mediaGroupId) {
-  // 等待正在创建的组
-  while (creatingGroups.has(mediaGroupId)) {
-    await new Promise(r => setTimeout(r, 10));
-  }
-  
-  let group = mediaGroupBuffer.get(mediaGroupId);
-  
-  if (group) {
-    if (!group.messages.some(m => m.message_id === messageId)) {
-      group.messages.push({ message_id: messageId, timestamp: Date.now() });
-      group.lastUpdate = Date.now();
-      const count = group.messages.length;
-      console.log(`📸 ${mediaGroupId}: ${count}条`);
-      
-      if (count === MAX_MEDIA_GROUP_SIZE) {
-        console.log(`🚀 达到10条，立即发送`);
-        await finalizeMediaGroup(env, chatId, mediaGroupId);
-      }
-    }
-  } else {
-    // 加锁创建
-    creatingGroups.add(mediaGroupId);
-    try {
+    } else {
       console.log(`📸 ${mediaGroupId}: 创建 (1条)`);
+      const timeout = getTimeout(1);
+      const timerId = setTimeout(() => {
+        console.log(`⏰ 超时: ${mediaGroupId} (1条)`);
+        finalizeMediaGroup(env, chatId, mediaGroupId);
+      }, timeout);
+      
       mediaGroupBuffer.set(mediaGroupId, {
         messages: [{ message_id: messageId, timestamp: Date.now() }],
         lastUpdate: Date.now(),
         chatId: chatId,
-        isProcessing: false
+        isProcessing: false,
+        timerId: timerId
       });
-    } finally {
-      creatingGroups.delete(mediaGroupId);
     }
   }
+  
+  isProcessing = false;
 }
 
-async function handleNormalMessage(env, ctx, chatId, messageId) {
-  // 发送所有缓冲的媒体组
+async function handleNormalMessage(env, chatId, messageId) {
+  // 先发送所有缓冲的媒体组
   for (const [groupId, group] of mediaGroupBuffer.entries()) {
     if (group && !group.isProcessing) {
+      if (group.timerId) clearTimeout(group.timerId);
       await finalizeMediaGroup(env, chatId, groupId);
     }
   }
@@ -169,24 +152,19 @@ async function handleUpdate(env, ctx, update) {
   const mediaGroupId = msg.media_group_id;
   
   if (mediaGroupId) {
-    await handleMediaGroupMessage(env, ctx, chatId, messageId, mediaGroupId);
+    // 加入队列
+    messageQueue.push({ chatId, messageId, mediaGroupId });
+    // 启动队列处理（单线程）
+    await processQueue(env, ctx);
   } else {
-    await handleNormalMessage(env, ctx, chatId, messageId);
+    await handleNormalMessage(env, chatId, messageId);
   }
 }
-
-let globalPollingStarted = false;
 
 export default {
   async fetch(request, env, ctx) {
     if (!env.BOT_TOKEN || !env.ADMIN_USER_ID) {
       return new Response('Missing env vars', { status: 500 });
-    }
-    
-    // 只启动一次全局轮询
-    if (!globalPollingStarted) {
-      globalPollingStarted = true;
-      ctx.waitUntil(globalPolling(env));
     }
     
     const url = new URL(request.url);
@@ -196,13 +174,14 @@ export default {
       for (const [id, g] of mediaGroupBuffer.entries()) {
         info[id] = { count: g.messages.length };
       }
-      return new Response(JSON.stringify({ buffer: info, polling: globalPollingStarted }), {
+      return new Response(JSON.stringify({ buffer: info, queue: messageQueue.length }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
     
     if (request.method === 'POST' && url.pathname === '/flush') {
       for (const [id, g] of mediaGroupBuffer.entries()) {
+        if (g.timerId) clearTimeout(g.timerId);
         await finalizeMediaGroup(env, g.chatId, id);
       }
       return new Response('Flushed');
@@ -211,7 +190,7 @@ export default {
     if (request.method === 'POST' && url.pathname === '/webhook') {
       try {
         const update = await request.json();
-        ctx.waitUntil(handleUpdate(env, ctx, update));
+        await handleUpdate(env, ctx, update);
         return new Response('OK', { status: 200 });
       } catch (error) {
         console.error(error);
