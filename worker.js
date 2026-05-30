@@ -123,9 +123,8 @@ async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
   const token = env.BOT_TOKEN;
   const kvKey = `mg_${chatId}_${groupId}`;
   
-  // 提取消息中的媒体信息
+  // 提取消息中的媒体信息（代码不变）
   let mediaInfo = null;
-  
   if (message.photo) {
     const largestPhoto = message.photo[message.photo.length - 1];
     mediaInfo = { 
@@ -157,13 +156,24 @@ async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
       messages: [],
       flushed: false,
       isSending: false,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      delayPromise: null  // 存储延迟任务的 Promise
     };
     
-    // 创建延迟发送的 Promise
-    const timerPromise = createTimerPromise(env, token, kvKey, chatId, 500);
-    cache.timerPromise = timerPromise;
-    ctx.waitUntil(timerPromise);
+    // 使用 ctx.waitUntil 确保延迟任务执行
+    const delayPromise = (async () => {
+      // 等待 500ms
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // 再次检查缓存是否还存在且未发送
+      const currentCache = mediaGroupCache.get(kvKey);
+      if (currentCache && !currentCache.flushed && currentCache.messages.length > 0) {
+        await flushMediaGroup(token, kvKey, chatId);
+      }
+    })();
+    
+    cache.delayPromise = delayPromise;
+    ctx.waitUntil(delayPromise);  // 关键：让 Worker 等待这个任务完成
     
     mediaGroupCache.set(kvKey, cache);
   }
@@ -175,9 +185,12 @@ async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
     timestamp: Date.now()
   });
   
-  // 如果达到10条，立即发送
+  // 如果达到10条，取消延迟任务并立即发送
   if (cache.messages.length >= 10 && !cache.flushed && !cache.isSending) {
-    cache.flushed = true;
+    // 注意：无法真正取消已经开始的 Promise，但可以设置标志位
+    cache.flushed = true;  // 设置标志，让延迟任务中的检查失败
+    
+    // 如果有 delayPromise 变量，但无法取消，只能靠标志位
     await flushMediaGroup(token, kvKey, chatId);
   }
   
