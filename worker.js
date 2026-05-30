@@ -10,6 +10,9 @@ const mediaGroupCache = new Map();
 // Promise 缓存：防止并发创建重复缓存
 const pendingGroupPromises = new Map();
 
+// ========== 新增：队列串行化 ==========
+const groupQueues = new Map();
+
 // 全局清理调度器标志
 let cleanupScheduled = false;
 
@@ -155,120 +158,107 @@ async function globalCleanup(env, chatId, ctx) {
   console.log(`✅ 所有缓存已清理，停止调度`);
 }
 
-// 处理媒体组缓存（使用原子锁）
-async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
-  const token = env.BOT_TOKEN;
-  const kvKey = `mg_${chatId}_${groupId}`;
-  
-  // 提取消息中的媒体信息
-  let mediaInfo = null;
+// ========== 新增：提取媒体信息的辅助函数 ==========
+function extractMediaInfo(message) {
   if (message.photo) {
     const largestPhoto = message.photo[message.photo.length - 1];
-    mediaInfo = { 
+    return { 
       type: 'photo', 
       fileId: largestPhoto.file_id,
       caption: message.caption || ''
     };
   } else if (message.video) {
-    mediaInfo = { 
+    return { 
       type: 'video', 
       fileId: message.video.file_id,
       caption: message.caption || ''
     };
   } else if (message.document) {
-    mediaInfo = { 
+    return { 
       type: 'document', 
       fileId: message.document.file_id,
       caption: message.caption || ''
     };
-  } else {
-    return false;
+  }
+  return null;
+}
+
+// ========== 新增：实际处理媒体消息的函数（被队列调用） ==========
+async function processMediaMessage(env, message, groupId, chatId, messageId, ctx) {
+  const token = env.BOT_TOKEN;
+  const kvKey = `mg_${chatId}_${groupId}`;
+  
+  // 提取媒体信息
+  const mediaInfo = extractMediaInfo(message);
+  if (!mediaInfo) return false;
+  
+  let cache = mediaGroupCache.get(kvKey);
+  
+  if (!cache) {
+    cache = {
+      messages: [],
+      isSending: false,
+      createdAt: Date.now()
+    };
+    mediaGroupCache.set(kvKey, cache);
+    console.log(`🆕 创建新缓存: ${kvKey}`);
+    
+    // 启动全局清理器
+    if (!cleanupScheduled) {
+      ctx.waitUntil(globalCleanup(env, chatId, ctx));
+    }
   }
   
-  // 使用原子操作：检查并创建锁
-  while (true) {
-    const currentPromise = pendingGroupPromises.get(kvKey);
-    
-    // 如果没有锁，尝试获取锁
-    if (!currentPromise) {
-      const newPromise = (async () => {
-        let cache = mediaGroupCache.get(kvKey);
-        
-        if (!cache) {
-          cache = {
-            messages: [],
-            isSending: false,
-            createdAt: Date.now()
-          };
-          mediaGroupCache.set(kvKey, cache);
-          console.log(`🆕 创建新缓存: ${kvKey}`);
-          
-          // 只启动一次全局清理器
-          if (!cleanupScheduled) {
-            ctx.waitUntil(globalCleanup(env, chatId, ctx));
-          }
-        }
-        
-        // 添加消息到缓存
-        cache.messages.push({
-          ...mediaInfo,
-          messageId: messageId,
-          timestamp: Date.now()
-        });
-        
-        const currentCount = cache.messages.length;
-        console.log(`📥 缓存消息 (${currentCount}/10): ${kvKey}`);
-        
-        // 如果达到10条，立即发送
-        if (currentCount >= 10 && !cache.isSending) {
-          console.log(`🎯 达到10条，立即发送: ${kvKey}`);
-          await flushMediaGroup(token, kvKey, chatId, ctx);
-        }
-      })();
-      
-      // 使用 compare-and-swap 逻辑设置锁
-      if (!pendingGroupPromises.has(kvKey)) {
-        pendingGroupPromises.set(kvKey, newPromise);
-        try {
-          await newPromise;
-        } finally {
-          // 不要立即删除，避免其他等待的请求重新创建
-          setTimeout(() => {
-            if (pendingGroupPromises.get(kvKey) === newPromise) {
-              pendingGroupPromises.delete(kvKey);
-            }
-          }, 200);
-        }
-        return true;
-      }
-      // 如果竞争失败，继续循环
-      continue;
-    }
-    
-    // 有锁，等待锁释放后重新尝试
-    console.log(`⏳ 等待现有锁释放: ${kvKey}`);
-    await currentPromise;
-    // 锁释放后，直接添加到已存在的缓存
-    const cache = mediaGroupCache.get(kvKey);
-    if (cache && !cache.isSending) {
-      cache.messages.push({
-        ...mediaInfo,
-        messageId: messageId,
-        timestamp: Date.now()
-      });
-      const currentCount = cache.messages.length;
-      console.log(`📥 添加到现有缓存 (${currentCount}/10): ${kvKey}`);
-      
-      if (currentCount >= 10 && !cache.isSending) {
-        console.log(`🎯 达到10条，立即发送: ${kvKey}`);
-        await flushMediaGroup(token, kvKey, chatId, ctx);
-      }
-      return true;
-    }
-    
-    // 缓存异常，重新尝试获取锁
-    console.log(`⚠️ 缓存异常，重试: ${kvKey}`);
+  // 添加消息到缓存
+  cache.messages.push({
+    ...mediaInfo,
+    messageId: messageId,
+    timestamp: Date.now()
+  });
+  
+  const currentCount = cache.messages.length;
+  console.log(`📥 缓存消息 (${currentCount}/10): ${kvKey}`);
+  
+  // 如果达到10条，立即发送
+  if (currentCount >= 10 && !cache.isSending) {
+    console.log(`🎯 达到10条，立即发送: ${kvKey}`);
+    await flushMediaGroup(token, kvKey, chatId, ctx);
   }
+  
+  return true;
+}
+
+// ========== 修改：处理媒体组缓存（使用队列串行化） ==========
+async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
+  const kvKey = `mg_${chatId}_${groupId}`;
+  
+  // 获取或创建队列
+  if (!groupQueues.has(kvKey)) {
+    groupQueues.set(kvKey, Promise.resolve());
+  }
+  
+  const queue = groupQueues.get(kvKey);
+  
+  // 将任务加入队列，确保串行执行
+  const newTask = queue.then(async () => {
+    return processMediaMessage(env, message, groupId, chatId, messageId, ctx);
+  });
+  
+  groupQueues.set(kvKey, newTask);
+  
+  // 清理完成的队列（60秒后，避免内存泄漏）
+  newTask.finally(() => {
+    if (groupQueues.get(kvKey) === newTask) {
+      setTimeout(() => {
+        if (groupQueues.get(kvKey) === newTask) {
+          groupQueues.delete(kvKey);
+          console.log(`🧹 清理队列: ${kvKey}`);
+        }
+      }, 60000);
+    }
+  });
+  
+  return newTask;
 }
 
 // 主处理函数
@@ -303,7 +293,7 @@ async function handleUpdate(update, env, ctx) {
     return;
   }
   
-  // 处理媒体组
+  // 处理媒体组（使用队列串行化）
   await handleMediaGroup(env, message, mediaGroupId, chatId, messageId, ctx);
 }
 
