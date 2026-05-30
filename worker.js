@@ -7,6 +7,9 @@
 // 内存缓存：存储媒体组消息
 const mediaGroupCache = new Map();
 
+// 锁 Map：防止并发创建多个缓存
+const cacheLocks = new Map();
+
 // 辅助函数：发送请求到 Telegram API
 async function tgRequest(token, method, params) {
   const url = `https://api.telegram.org/bot${token}/${method}`;
@@ -51,7 +54,7 @@ async function sendMediaGroup(token, chatId, mediaGroupInput) {
 }
 
 // 发送媒体组并删除原消息
-async function flushMediaGroup(token, kvKey, chatId) {
+async function flushMediaGroup(token, kvKey, chatId, ctx) {
   const cache = mediaGroupCache.get(kvKey);
   if (!cache || cache.messages.length === 0) return;
   
@@ -91,11 +94,17 @@ async function flushMediaGroup(token, kvKey, chatId) {
       await sendMediaGroup(token, chatId, mediaGroupInput);
     }
     
-    // 删除所有原消息
-    for (const msg of cache.messages) {
-      await deleteMessage(token, chatId, msg.messageId);
-    }
-    console.log(`🗑️ 删除 ${messageCount} 条原消息`);
+    // 并发删除所有原消息，并确保 Worker 等待完成
+    const deletePromise = (async () => {
+      const deleteTasks = cache.messages.map(msg => 
+        deleteMessage(token, chatId, msg.messageId)
+      );
+      await Promise.all(deleteTasks);
+      console.log(`🗑️ 并发删除完成 ${messageCount} 条原消息`);
+    })();
+    
+    // 使用 ctx.waitUntil 确保删除操作在后台完成
+    ctx.waitUntil(deletePromise);
     
   } catch (error) {
     console.error(`发送媒体组失败: ${error.message}`);
@@ -106,12 +115,12 @@ async function flushMediaGroup(token, kvKey, chatId) {
 }
 
 // 创建延迟发送的 Promise
-function createTimerPromise(env, token, kvKey, chatId, delayMs = 500) {
+function createTimerPromise(env, token, kvKey, chatId, delayMs = 500, ctx) {
   return new Promise((resolve) => {
     setTimeout(async () => {
       const cache = mediaGroupCache.get(kvKey);
       if (cache && !cache.flushed && cache.messages.length > 0) {
-        await flushMediaGroup(token, kvKey, chatId);
+        await flushMediaGroup(token, kvKey, chatId, ctx);
       }
       resolve();
     }, delayMs);
@@ -123,7 +132,7 @@ async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
   const token = env.BOT_TOKEN;
   const kvKey = `mg_${chatId}_${groupId}`;
   
-  // 提取消息中的媒体信息（代码不变）
+  // 提取消息中的媒体信息
   let mediaInfo = null;
   if (message.photo) {
     const largestPhoto = message.photo[message.photo.length - 1];
@@ -148,50 +157,59 @@ async function handleMediaGroup(env, message, groupId, chatId, messageId, ctx) {
     return false;
   }
   
-  // 获取或创建缓存
-  let cache = mediaGroupCache.get(kvKey);
-  
-  if (!cache) {
-    cache = {
-      messages: [],
-      flushed: false,
-      isSending: false,
-      createdAt: Date.now(),
-      delayPromise: null  // 存储延迟任务的 Promise
-    };
-    
-    // 使用 ctx.waitUntil 确保延迟任务执行
-    const delayPromise = (async () => {
-      // 等待 500ms
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      // 再次检查缓存是否还存在且未发送
-      const currentCache = mediaGroupCache.get(kvKey);
-      if (currentCache && !currentCache.flushed && currentCache.messages.length > 0) {
-        await flushMediaGroup(token, kvKey, chatId);
-      }
-    })();
-    
-    cache.delayPromise = delayPromise;
-    ctx.waitUntil(delayPromise);  // 关键：让 Worker 等待这个任务完成
-    
-    mediaGroupCache.set(kvKey, cache);
+  // 获取锁，防止并发创建多个缓存
+  while (cacheLocks.get(kvKey)) {
+    await new Promise(resolve => setTimeout(resolve, 5));
   }
+  cacheLocks.set(kvKey, true);
   
-  // 添加消息到缓存
-  cache.messages.push({
-    ...mediaInfo,
-    messageId: messageId,
-    timestamp: Date.now()
-  });
-  
-  // 如果达到10条，取消延迟任务并立即发送
-  if (cache.messages.length >= 10 && !cache.flushed && !cache.isSending) {
-    // 注意：无法真正取消已经开始的 Promise，但可以设置标志位
-    cache.flushed = true;  // 设置标志，让延迟任务中的检查失败
+  try {
+    // 获取或创建缓存
+    let cache = mediaGroupCache.get(kvKey);
     
-    // 如果有 delayPromise 变量，但无法取消，只能靠标志位
-    await flushMediaGroup(token, kvKey, chatId);
+    if (!cache) {
+      cache = {
+        messages: [],
+        flushed: false,
+        isSending: false,
+        createdAt: Date.now(),
+        delayPromise: null
+      };
+      
+      // 使用 ctx.waitUntil 确保延迟任务执行
+      const delayPromise = (async () => {
+        // 等待 500ms
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // 再次检查缓存是否还存在且未发送
+        const currentCache = mediaGroupCache.get(kvKey);
+        if (currentCache && !currentCache.flushed && currentCache.messages.length > 0) {
+          await flushMediaGroup(token, kvKey, chatId, ctx);
+        }
+      })();
+      
+      cache.delayPromise = delayPromise;
+      ctx.waitUntil(delayPromise);
+      
+      mediaGroupCache.set(kvKey, cache);
+    }
+    
+    // 添加消息到缓存
+    cache.messages.push({
+      ...mediaInfo,
+      messageId: messageId,
+      timestamp: Date.now()
+    });
+    
+    // 如果达到10条，立即发送
+    if (cache.messages.length >= 10 && !cache.flushed && !cache.isSending) {
+      cache.flushed = true;
+      await flushMediaGroup(token, kvKey, chatId, ctx);
+    }
+    
+  } finally {
+    // 释放锁
+    cacheLocks.delete(kvKey);
   }
   
   return true;
